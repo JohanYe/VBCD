@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
 from accelerate import Accelerator
-from models.crownmvm import CrownMVM,volume_to_point_cloud_tensor
+from models.crownmvm2 import CrownMVM,volume_to_point_cloud_tensor
 from models.loss import curvature_penalty_loss
 import os
 import random
@@ -43,8 +43,6 @@ def train(model, train_loader, val_loader,args,log_file):
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_steps)
     model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
     train_loader = cycle(train_loader)
-    
-    
     
     initial_step = 0
     step = initial_step
