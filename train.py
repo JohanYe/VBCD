@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +18,8 @@ import logging
 from pytorch3d.loss import chamfer_distance
 from pytorch3d.ops import sample_farthest_points
 import pyvista as pv
-from mydataset.Dentaldataset import *
+# from mydataset.Dentaldataset import *
+from dentaldataset import IOS_Datasetv2
 from accelerate import DataLoaderConfiguration,DistributedDataParallelKwargs
 focal_loss = True
 curvature_weight = 2
@@ -59,14 +61,20 @@ def train(model, train_loader, val_loader,args,log_file):
                     curvatures_weighted = torch.where(non_zero_mask, 1+curvatures, curvatures)
                     criterition = nn.BCEWithLogitsLoss(weight=torch.exp(curvatures_weighted.unsqueeze(1)))
                 else:
-                    criterition = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(10.0))
+                    criterition = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(10.0, device=accelerator.device))
+                    
                 with accelerator.autocast():
-                    voxel_ind,voxel_normal,refined_pos_with_normal,batch_x = model(inputs,min_bound_crop)
+                    tooth_number = torch.tensor([3], device=inputs.device).long()
+                    voxel_ind,refined_pos_with_normal,batch_x = model(inputs,tooth_number)
+                    if step < 3:
+                        torch.cuda.synchronize()
+                        print(f"[Rank {accelerator.process_index}] forward done: {time.time() - t0:.3f}s")
                     if step % 2500 ==0  : logging.info(f'The front points has {refined_pos_with_normal.shape[0]} points')
                     bce_loss = criterition(voxel_ind,targets[:,:1,:,:,:])
                     cpl,normal_loss = curvature_penalty_loss(refined_pos_with_normal,pointcloud_inform,batch_x=batch_x,batch_y=batch_y) if step>100000 else (0,0)
                     refine_loss = 0.1*cpl + normal_loss
-                    loss = bce_loss + F.mse_loss(voxel_normal,targets[:,1:4,:,:,:]) + refine_loss 
+                    # loss = bce_loss + F.mse_loss(voxel_normal,targets[:,1:4,:,:,:]) + refine_loss 
+                    loss = bce_loss + refine_loss 
                     loss = loss/ args.accumulation_steps
                     total_loss += loss.item()
                 accelerator.backward(loss)
@@ -122,11 +130,12 @@ def validate(model, val_loader, step,save_path='./chamfer_validation_outputs'):
         for batch_idx,(inputs,targets,pointcloud_inform,batch_y,min_bound_crop,file_dir) in enumerate(val_loader):
            
             with accelerator.autocast():
-                voxel_ind,voxel_normal,refined_pos_with_normal,batch_x = model(inputs,min_bound_crop)   
+                tooth_number = torch.tensor([3], device=inputs.device).long()
+                voxel_ind,refined_pos_with_normal,batch_x = model(inputs,tooth_number)   
             position_indicator = F.sigmoid(voxel_ind)
             position_indicator = (position_indicator>0.5).float()
 
-            outputs_pc = volume_to_point_cloud(volume=position_indicator,voxel_size=(0.15625,0.15625,0.15625),origin=min_bound_crop.cpu())
+            outputs_pc = volume_to_point_cloud_tensor(volume=position_indicator,voxel_size=(0.15625,0.15625,0.15625),origin=min_bound_crop.cpu())
             hausdorff = dice_coefficient(position_indicator,targets[:,:1,:,:,:]).item()
             val_hausdorff += hausdorff
             if batch_idx < 2:
@@ -173,8 +182,8 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for optimizer')
     parser.add_argument('--accumulation_steps', type=int, default=4, help='Number of steps for gradient accumulation')
     parser.add_argument('--save_path', type=str, default='./unet3d_model.pth', help='Path to save the trained model')
-    parser.add_argument('--train_path', type=str, default='./train_data', help='Path to training data')
-    parser.add_argument('--val_path', type=str, default='./val_data', help='Path to validation data')
+    parser.add_argument('--train_path', type=str, default='/train/PointCrown/PointCrown_v1.4.9', help='Path to training data')
+    parser.add_argument('--val_path', type=str, default='/train/PointCrown/PointCrown_v1.4.9', help='Path to validation data')
     parser.add_argument('--validation_interval',type=int,default=4000,help='interval steps to validate')
     parser.add_argument('--continue_ckpt_dir',type=str,required=False,help='whether to use exist ckpt')
     parser.add_argument('--log_interval', type=int, default=50, help='Interval steps to log training information')
