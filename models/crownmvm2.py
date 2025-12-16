@@ -4,47 +4,48 @@ from torch import nn
 from pytorch3d.ops import sample_farthest_points
 import torch
 import torch.nn.functional as F
+from dataset import volume_to_point_cloud_tensor
 
 
-def volume_to_point_cloud_tensor(
-    volume: torch.Tensor, 
-    voxel_size=(0.2, 0.2, 0.2), 
+# def volume_to_point_cloud_tensor(
+#     volume: torch.Tensor, 
+#     voxel_size=(0.2, 0.2, 0.2), 
   
-):
+# ):
 
 
-    device = volume.device
-    B, C, D, H, W = volume.shape
-    assert C == 1
-
-    
-    if not torch.is_tensor(voxel_size):
-        voxel_size_tensor = torch.tensor(voxel_size, 
-                                         device=device, 
-                                         dtype=torch.float32)  # [3]
-    else:
-        voxel_size_tensor = voxel_size.to(device=device, dtype=torch.float32)     
-
-
-    foreground_prob = torch.sigmoid(volume)                     # [B, 1, D, H, W]
-    foreground_mask = (foreground_prob > 0.5).squeeze(1)        # [B, D, H, W]
-   
-    nonzero_indices = torch.nonzero(foreground_mask, as_tuple=False)
-   
-    b = nonzero_indices[:, 0].long()  # batch index
-    d = nonzero_indices[:, 1].long()  # depth index
-    h = nonzero_indices[:, 2].long()  # height index
-    w = nonzero_indices[:, 3].long()  # width index
-
-    coords_dhw = torch.stack([d ,h, w], dim=-1).float()  # [N, 3]
-
-    coords_xyz =  coords_dhw * voxel_size_tensor  # [N, 3]
+#     device = volume.device
+#     B, C, D, H, W = volume.shape
+#     assert C == 1
 
     
-    b_float = b.float().unsqueeze(-1)  # [N, 1]
-    point_cloud = torch.cat([b_float,coords_xyz], dim=-1)  # [N, 4]
+#     if not torch.is_tensor(voxel_size):
+#         voxel_size_tensor = torch.tensor(voxel_size, 
+#                                          device=device, 
+#                                          dtype=torch.float32)  # [3]
+#     else:
+#         voxel_size_tensor = voxel_size.to(device=device, dtype=torch.float32)     
 
-    return point_cloud
+
+#     foreground_prob = torch.sigmoid(volume)                     # [B, 1, D, H, W]
+#     foreground_mask = (foreground_prob > 0.5).squeeze(1)        # [B, D, H, W]
+   
+#     nonzero_indices = torch.nonzero(foreground_mask, as_tuple=False)
+   
+#     b = nonzero_indices[:, 0].long()  # batch index
+#     d = nonzero_indices[:, 1].long()  # depth index
+#     h = nonzero_indices[:, 2].long()  # height index
+#     w = nonzero_indices[:, 3].long()  # width index
+
+#     coords_dhw = torch.stack([d ,h, w], dim=-1).float()  # [N, 3]
+
+#     coords_xyz =  coords_dhw * voxel_size_tensor  # [N, 3]
+
+    
+#     b_float = b.float().unsqueeze(-1)  # [N, 1]
+#     point_cloud = torch.cat([b_float,coords_xyz], dim=-1)  # [N, 4]
+
+#     return point_cloud
 
 
 class CrownMVM(nn.Module):
@@ -80,5 +81,5 @@ class CrownMVM(nn.Module):
         refined_pos = offset + pred_pc[:,1:]
         refined_pos_with_normal = torch.cat([refined_pos,normals],dim=1)
         batch_x = pred_pc[:,0]
-        return voxel_ind,refined_pos_with_normal,batch_x
+        return voxel_ind, refined_pos_with_normal,batch_x
 

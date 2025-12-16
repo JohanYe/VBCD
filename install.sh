@@ -42,6 +42,9 @@ uv pip install \
     scikit-image \
     scipy \
     timm \
+    trimesh \
+    rtree \
+    tensorboard \
     torch==2.4.1+cu118 \
     torchaudio==2.4.1+cu118 \
     torchvision==0.19.1+cu118 \

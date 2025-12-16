@@ -18,6 +18,9 @@ import logging
 from pytorch3d.loss import chamfer_distance
 from pytorch3d.ops import sample_farthest_points
 import pyvista as pv
+import open3d as o3d
+from scipy import ndimage
+from skimage import measure
 # from mydataset.Dentaldataset import *
 from dentaldataset import IOS_Datasetv2
 from accelerate import DataLoaderConfiguration,DistributedDataParallelKwargs
@@ -56,7 +59,7 @@ def create_run_directory(base_output_dir, exp_name=None):
     
     return run_dir
 
-def save_visualization(outputs_pc, targets, pointcloud_inform, batch_y, step, vis_dir, rank, batch_idx=0):
+def save_visualization(outputs_pc, targets, pointcloud_inform, batch_y, step, vis_dir, rank, batch_size, batch_idx=0):
     """Save point cloud and mesh visualizations for debugging"""
     # vis_dir is now the full path, just ensure it exists
     if not os.path.exists(vis_dir):
@@ -65,22 +68,29 @@ def save_visualization(outputs_pc, targets, pointcloud_inform, batch_y, step, vi
     # Only save from rank 0 to avoid conflicts
     if rank == 0:
         targets_np = targets.cpu().numpy()
-        for i in range(len(outputs_pc)):
+        for i in range(batch_size):
             try:
+                # Extract points belonging to this batch index
+                batch_mask = (outputs_pc[:, 0] == i)
+                batch_points = outputs_pc[batch_mask][:, 1:].cpu().numpy()  # [N, 3]
+                
+                # Get ground truth points for this batch item
                 mask = (batch_y == i)
                 gtpoints = pointcloud_inform[mask][:,:3].cpu().numpy()
                 
-                # Save prediction point cloud
-                point_cloud = pv.PolyData(outputs_pc[i].cpu().numpy() if torch.is_tensor(outputs_pc[i]) else outputs_pc[i])
-                output_filename = os.path.join(vis_dir, f"pred_step{step}_batch{batch_idx}_sample{i}.ply")
-                point_cloud.save(output_filename)
+                # Save prediction point cloud only if we have valid points
+                if len(batch_points) > 0:
+                    point_cloud = pv.PolyData(batch_points)
+                    output_filename = os.path.join(vis_dir, f"pred_step{step}_batch{batch_idx}_sample{i}.ply")
+                    point_cloud.save(output_filename)
+                    logging.info(f"[Rank {rank}] Visualization saved: {output_filename}")
                 
                 # Save ground truth point cloud
-                point_cloud_gt = pv.PolyData(gtpoints)
-                gt_filename = os.path.join(vis_dir, f"gt_step{step}_batch{batch_idx}_sample{i}.ply")
-                point_cloud_gt.save(gt_filename)
-                
-                logging.info(f"[Rank {rank}] Visualization saved: {output_filename}, {gt_filename}")
+                if len(gtpoints) > 0:
+                    point_cloud_gt = pv.PolyData(gtpoints)
+                    gt_filename = os.path.join(vis_dir, f"gt_step{step}_batch{batch_idx}_sample{i}.ply")
+                    point_cloud_gt.save(gt_filename)
+                    logging.info(f"[Rank {rank}] Visualization saved: {gt_filename}")
             except Exception as e:
                 logging.warning(f"[Rank {rank}] Failed to save visualization for sample {i}: {str(e)}")
 
@@ -186,6 +196,7 @@ def train(model, train_loader, val_loader, args, log_file, run_dir):
                         )
                         
                         # Save visualizations
+                        batch_size_vis = inputs_vis.shape[0]
                         save_visualization(
                             outputs_pc_vis, 
                             targets_vis, 
@@ -193,7 +204,8 @@ def train(model, train_loader, val_loader, args, log_file, run_dir):
                             batch_y_vis, 
                             step, 
                             os.path.join(run_dir, 'visualizations'),
-                            accelerator.process_index
+                            accelerator.process_index,
+                            batch_size_vis
                         )
                         logging.info(f"[Rank {accelerator.process_index}] Visualization saved at step {step}")
                     except Exception as e:
@@ -233,6 +245,53 @@ def train(model, train_loader, val_loader, args, log_file, run_dir):
         logging.info(f"[Rank {accelerator.process_index}] TensorBoard writer closed")
 
 
+def voxel_to_mesh(voxel_grid, output_path, origin=None, voxel_size=None):
+    """
+    Convert binary voxel grid to mesh using marching cubes.
+    
+    Args:
+        voxel_grid: Binary voxel grid [1, D, H, W] or [D, H, W]
+        output_path: Path to save the mesh (.ply file)
+        origin: Origin coordinates to transform vertices [x, y, z]
+        voxel_size: Voxel size for scaling [sx, sy, sz]
+    """
+    try:
+        # Ensure 3D numpy array
+        if torch.is_tensor(voxel_grid):
+            voxel_numpy = voxel_grid.squeeze().detach().cpu().numpy()
+        else:
+            voxel_numpy = np.asarray(voxel_grid).squeeze()
+        
+        # Apply marching cubes
+        try:
+            verts, faces, normals, values = measure.marching_cubes(
+                voxel_numpy, level=0.5, spacing=(1, 1, 1), step_size=1
+            )
+        except:
+            # Fallback if spacing parameter doesn't work
+            verts, faces, normals, values = measure.marching_cubes(voxel_numpy, level=0.5)
+        
+        # Scale vertices if voxel_size provided
+        if voxel_size is not None:
+            verts = verts * np.array(voxel_size)
+        
+        # Translate vertices if origin provided
+        if origin is not None:
+            origin_np = origin.cpu().numpy() if torch.is_tensor(origin) else np.array(origin)
+            verts = verts + origin_np
+        
+        # Create and save mesh using Open3D
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+        mesh.compute_vertex_normals()
+        
+        o3d.io.write_triangle_mesh(output_path, mesh)
+        return True, len(verts)
+    except Exception as e:
+        logging.warning(f"Meshing failed: {e}")
+        return False, 0
+
 def dice_coefficient(tensor1, tensor2, epsilon=1e-6):
     assert tensor1.shape == tensor2.shape, "两个输入张量的形状必须相同"
     tensor1 = tensor1.float()
@@ -262,17 +321,53 @@ def validate(model, val_loader, step, save_path='./visualizations', rank=0):
             val_hausdorff += hausdorff
             if batch_idx < 2:
                 targets_np = targets.cpu().numpy()
-                for i in range(len(outputs_pc)):
+                batch_size = inputs.shape[0]
+                voxel_size = (0.15625, 0.15625, 0.15625)
+                for i in range(batch_size):
+                    # Extract points belonging to this batch index
+                    batch_mask = (outputs_pc[:, 0] == i)
+                    batch_points = outputs_pc[batch_mask][:, 1:].cpu().numpy()  # [N, 3]
+                    
+                    # Get ground truth points for this batch item
                     mask = (batch_y == i)
                     gtpoints = pointcloud_inform[mask][:,:3].cpu().numpy()
-                    point_cloud_gt = pv.PolyData(gtpoints)
-                    point_cloud = pv.PolyData(outputs_pc[i].cpu().numpy() if torch.is_tensor(outputs_pc[i]) else outputs_pc[i])
-                    output_filename = os.path.join(save_path, f"val_output_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
-                    gt_filename = os.path.join(save_path, f"val_gt_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
-                    point_cloud.save(output_filename)
-                    point_cloud_gt.save(gt_filename)
-                    logging.info(f"[Rank {rank}] Saved: {output_filename}")
-                    logging.info(f"[Rank {rank}] Saved: {gt_filename}")
+                    
+                    # Save point cloud visualization
+                    if len(batch_points) > 0:
+                        point_cloud = pv.PolyData(batch_points)
+                        output_filename = os.path.join(save_path, f"val_output_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
+                        point_cloud.save(output_filename)
+                        logging.info(f"[Rank {rank}] Saved: {output_filename}")
+                    
+                    if len(gtpoints) > 0:
+                        point_cloud_gt = pv.PolyData(gtpoints)
+                        gt_filename = os.path.join(save_path, f"val_gt_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
+                        point_cloud_gt.save(gt_filename)
+                        logging.info(f"[Rank {rank}] Saved: {gt_filename}")
+                    
+                    # Save mesh visualization
+                    pred_voxel = position_indicator[i:i+1]  # Get single sample from batch
+                    gt_voxel = targets[i:i+1, :1]  # Get single sample from batch
+                    
+                    # Predicted mesh
+                    success, num_verts = voxel_to_mesh(
+                        pred_voxel, 
+                        os.path.join(save_path, f"val_output_mesh_batch{batch_idx+1}_sample{i+1}_step{step}.ply"),
+                        origin=min_bound_crop[i],
+                        voxel_size=voxel_size
+                    )
+                    if success:
+                        logging.info(f"[Rank {rank}] Saved mesh with {num_verts} vertices: val_output_mesh_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
+                    
+                    # Ground truth mesh
+                    success_gt, num_verts_gt = voxel_to_mesh(
+                        gt_voxel,
+                        os.path.join(save_path, f"val_gt_mesh_batch{batch_idx+1}_sample{i+1}_step{step}.ply"),
+                        origin=min_bound_crop[i],
+                        voxel_size=voxel_size
+                    )
+                    if success_gt:
+                        logging.info(f"[Rank {rank}] Saved GT mesh with {num_verts_gt} vertices: val_gt_mesh_batch{batch_idx+1}_sample{i+1}_step{step}.ply")
                 
     val_hausdorff/=len(val_loader)
   
@@ -310,10 +405,28 @@ def main():
     parser.add_argument('--log_interval', type=int, default=50, help='Interval steps to log training information')
     parser.add_argument('--output_dir', type=str, default='./runs', help='Base directory for experiment runs')
     parser.add_argument('--exp_name', type=str, default=None, help='Optional experiment name for the run')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode with minimal steps to test all features')
     args = parser.parse_args()
     
+    # Debug mode: override settings for fast iteration
+    if args.debug:
+        args.num_steps = 400  # ~20 minutes total (covers 4 visualizations at steps 100, 200, 300, 400)
+        args.validation_interval = 200  # Validate at steps 200, 400
+        args.log_interval = 50  # Log every 50 steps
+        args.batch_size = min(2, args.batch_size)  # Use smaller batch
+        if accelerator.is_main_process:
+            print(f"\n{'='*60}")
+            print(f"DEBUG MODE ENABLED")
+            print(f"{'='*60}")
+            print(f"  - num_steps: {args.num_steps} (~20 minutes)")
+            print(f"  - batch_size: {args.batch_size}")
+            print(f"  - Visualizations at steps: 100, 200, 300, 400")
+            print(f"  - Validation at steps: 200, 400")
+            print(f"{'='*60}\n")
+    
     # Create timestamped run directory
-    run_dir = create_run_directory(args.output_dir, args.exp_name)
+    exp_name = args.exp_name or ("debug" if args.debug else None)
+    run_dir = create_run_directory(args.output_dir, exp_name)
     
     # Log GPU rank information
     if accelerator.is_main_process:
@@ -333,6 +446,10 @@ def main():
     if accelerator.is_main_process:
         logging.info(f"GPU Rank: {accelerator.process_index}/{accelerator.num_processes}")
         logging.info(f"Run output saved to: {run_dir}")
+        if args.debug:
+            logging.info("DEBUG MODE: Testing all features with minimal steps (400 total, ~20 minutes)")
+            logging.info(f"Visualizations: Every 100 steps (at steps 100, 200, 300, 400)")
+            logging.info(f"Validation: Every {args.validation_interval} steps")
     
     train_loader, val_loader = load_data(batch_size=args.batch_size, train_path=args.train_path)
     train(model, train_loader, val_loader, args, log_file=log_file, run_dir=run_dir)

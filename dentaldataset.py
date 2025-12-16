@@ -1,9 +1,12 @@
+import json
 import os
 from pathlib import Path
 import numpy as np
 import h5py
 import torch
 from torch.utils.data import Dataset
+from dataset import create_voxelwithnormal_grid, create_voxel_grid
+import trimesh
 
 
 class IOS_Datasetv2(Dataset):
@@ -17,48 +20,29 @@ class IOS_Datasetv2(Dataset):
         self.root_dir = Path(root_dir)
         self.crop_size = crop_size
         self.voxel_size = voxel_size
-        self.subdirs = [
-            "11",
-            "12",
-            "13",
-            "14",
-            "15",
-            "16",
-            "17",
-            "21",
-            "22",
-            "23",
-            "24",
-            "25",
-            "26",
-            "27",
-            "31",
-            "32",
-            "33",
-            "34",
-            "35",
-            "36",
-            "37",
-            "41",
-            "42",
-            "43",
-            "44",
-            "45",
-            "46",
-            "47",
-        ]
+
+        subset = "training" if is_train else "validation"
+        self.data_list_file = os.path.join(self.root_dir, f"{subset}.json")
+        print(f"[DATASET] Open file {self.data_list_file}")
+        with open(self.data_list_file, "r") as f:
+            data_subset = json.load(f)
+        self.init_data_paths(data_subset)
+
+    def init_data_paths(self, data_subset):
         self.data_paths = []
-        for subdir in self.subdirs:
-            subdir_path = self.root_dir / subdir
-            if is_train:
-                case_dir = subdir_path / "train"
-            else:
-                case_dir = subdir_path / "test"
-            for case in os.listdir(case_dir):
-                abs_case = os.path.join(case_dir, case)
-                crown_file = os.path.join(abs_case, "crown.h5")
-                pna_crop_file = os.path.join(abs_case, "pna_crop.h5")
-                self.data_paths.append((abs_case, crown_file, pna_crop_file))
+        for sample in data_subset:
+            file_path = os.path.join(self.root_dir, "DataSamples", sample, "DataFiles/")
+            crown_file = os.path.join(file_path, "outer_crown.ply")
+            pna_crop_file = os.path.join(file_path, "toothMesh.ply")
+            assert os.path.exists(crown_file), f"{crown_file} does not exist!"
+            assert os.path.exists(pna_crop_file), f"{pna_crop_file} does not exist!"
+            self.data_paths.append(
+                {
+                    "sample_path": file_path,
+                    "crown_file": crown_file,
+                    "pna_crop_file": pna_crop_file,
+                }
+            )
 
     def crop_mesh(self, mesh, center, crop_size):
         points = np.asarray(mesh)
@@ -80,14 +64,22 @@ class IOS_Datasetv2(Dataset):
         return len(self.data_paths)
 
     def __getitem__(self, idx):
-        dirpath, crown_file, pna_crop_file = self.data_paths[idx]
-        with h5py.File(crown_file, "r") as f:
-            crown_vertices = np.array(f["vertices"])
-            crown_normals = np.array(f["normals"])
-            curvatures = np.array(f["curvatures"])
-        with h5py.File(pna_crop_file, "r") as f:
-            pna_crop_vertices = np.array(f["vertices"])
-            pna_crop_normals = np.array(f["normals"])
+        sample = self.data_paths[idx]
+        dirpath = sample["sample_path"]
+        crown_file = sample["crown_file"]
+        pna_crop_file = sample["pna_crop_file"]
+
+        crown_mesh = trimesh.load(crown_file)
+        curvatures = trimesh.curvature.discrete_mean_curvature_measure(
+            crown_mesh, crown_mesh.vertices, radius=0.1
+        )
+        crown_vertices = crown_mesh.vertices
+        crown_normals = crown_mesh.vertex_normals
+
+        pna_crop_mesh = trimesh.load(pna_crop_file)
+        pna_crop_vertices = pna_crop_mesh.vertices
+        pna_crop_normals = pna_crop_mesh.vertex_normals
+
         crown_min_bound = crown_vertices.min(axis=0)
         crown_max_bound = crown_vertices.max(axis=0)
         crown_center = (crown_min_bound + crown_max_bound) / 2
@@ -114,8 +106,16 @@ class IOS_Datasetv2(Dataset):
         point_cloud_crown_inform = torch.tensor(
             point_cloud_full_inform, dtype=torch.float32
         )
+
+        pna_crop_voxel = create_voxel_grid(
+            pna_crop[:, :3], min_bound_crop, max_bound_crop, self.voxel_size
+        )
+        pna_crop_tensor = (
+            torch.from_numpy(pna_crop_voxel).float().unsqueeze(0)
+        )  # [1, D, H, W]
+
         return (
-            pna_crop_tensor[:, :3],
+            pna_crop_tensor,
             crown_tensor,
             point_cloud_crown_inform,
             torch.tensor(min_bound_crop, dtype=torch.float32),
@@ -130,9 +130,12 @@ class IOS_Datasetv2(Dataset):
             min_bound_crop,
             dirpath,
         ) = zip(*batch)
+
+        # This is the missing line - stack the tuple into [B, 1, D, H, W]
+        batched_pna = torch.stack(pna_crop_tensor)
+
         point_cloud_crown_tensor = [pc for pc in point_cloud_crown_tensor]
         combined_point_cloud = torch.cat(point_cloud_crown_tensor, dim=0)
-
         batch_sizes = [pc.shape[0] for pc in point_cloud_crown_tensor]
         batch_indices = torch.cat(
             [
@@ -142,7 +145,7 @@ class IOS_Datasetv2(Dataset):
         )
 
         return (
-            pna_crop_tensor,
+            batched_pna,
             torch.stack(crown_tensor),
             combined_point_cloud,
             batch_indices,
